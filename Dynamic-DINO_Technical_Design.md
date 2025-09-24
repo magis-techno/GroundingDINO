@@ -26,53 +26,70 @@
 ```
 
 #### 详细流程：
-1. **Backbone (EfficientViT-L1)**
+1. **Backbone (Swin Transformer)**
    - 输入图像切成 patch → patch embedding 
-   - 输出多尺度特征 (8×8, 16×16, 32×32)
-   - 代码位置: `self.backbone(samples)`
+   - 输出多尺度特征 (多个分辨率层级)
+   - 代码位置: 
+     - 调用: `groundingdino.py:212` → `self.features, self.poss = self.backbone(samples)`
+     - 实现: `backbone/backbone.py:107-116` → `BackboneBase.forward()`
+     - Swin详细: `backbone/swin_transformer.py:712-754` → `SwinTransformer.forward()`
 
 2. **Text Encoding**
    - 输入文本 → BERT 编码 → text tokens
-   - 代码位置: `self.bert(**tokenized_for_encoder)`
+   - 代码位置:
+     - Tokenization: `groundingdino.py:248-256` → `self.tokenizer(captions, ...)`
+     - BERT编码: `groundingdino.py:277` → `self.bert(**tokenized_for_encoder)`
+     - 特征映射: `groundingdino.py:279` → `self.feat_map(bert_output["last_hidden_state"])`
+     - BERT包装器: `bertwarper.py:31-166` → `BertModelWarper.forward()`
 
 3. **Encoder (TransformerEncoder)**
    - 多层 transformer block 融合图像和文本特征
    - 输出: image tokens (融合后的区域特征)
-   - 代码位置: `self.encoder(...)`
+   - 代码位置:
+     - 调用: `transformer.py:211-351` → `self.encoder(...)` 在 `Transformer.forward()` 中
+     - 实现: `transformer.py:482-595` → `TransformerEncoder.forward()`
+     - Encoder层: `transformer.py:738-799` → `DeformableTransformerEncoderLayer`
 
 4. **Language-guided Query Selection**
    - 结合图像 tokens 和 text tokens
    - 生成 900 个 query tokens (候选检测 query)
-   - 代码位置: `tgt_embed.weight` + `refpoint_embed.weight`
+   - 代码位置:
+     - Query初始化: `transformer.py:330-342` → `self.tgt_embed.weight` + `self.refpoint_embed.weight`
+     - 具体实现: `transformer.py:329-351` → 在 `Transformer.forward()` 中的 query 准备阶段
 
-5. **Decoder (TransformerDecoder)**
+5. **Decoder (TransformerDecoder)** ⭐️ **MoE改造目标**
    - 多个 transformer block，每层包含：
      - Cross-attention: query ↔ image tokens
      - **FFN**: 每个 query token 独立过 FFN ⭐️ **改造目标**
    - 输出: 900 个 query embedding
-   - 代码位置: `self.decoder(...)`
+   - 代码位置:
+     - 调用: `transformer.py:364-377` → `self.decoder(...)`
+     - Decoder实现: `transformer.py:633-735` → `TransformerDecoder.forward()`
+     - **FFN目标层**: `transformer.py:861-866` → `DeformableTransformerDecoderLayer.forward_ffn()`
+     - 具体FFN调用: `transformer.py:925` → `tgt = self.forward_ffn(tgt)`
 
 6. **Detection Head**
-   - 分类: `self.class_embed`
-   - 回归: `self.bbox_embed`
-   - 匹配: Hungarian matcher
+   - 分类: `groundingdino.py:343-348` → `self.class_embed`
+   - 回归: `groundingdino.py:332-340` → `self.bbox_embed`
+   - 匹配: Hungarian matcher (在损失计算中)
 
 ### 2.2 Decoder FFN 结构分析
 
 **当前 FFN 实现** (`DeformableTransformerDecoderLayer`):
 
 ```python
-# 初始化
+# 初始化 (transformer.py:839-845)
 self.linear1 = nn.Linear(d_model, d_ffn)           # 256 → 2048
-self.activation = _get_activation_fn(activation)    # ReLU/GELU
+self.activation = _get_activation_fn(activation, d_model=d_ffn, batch_dim=1)    # ReLU/GELU
 self.linear2 = nn.Linear(d_ffn, d_model)           # 2048 → 256
-self.dropout3 = nn.Dropout(dropout)
-self.dropout4 = nn.Dropout(dropout)
+self.dropout3 = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+self.dropout4 = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 self.norm3 = nn.LayerNorm(d_model)
 
-# 前向传播
+# 前向传播 (transformer.py:861-866)
 def forward_ffn(self, tgt):
-    tgt2 = self.linear2(self.dropout3(self.activation(self.linear1(tgt))))
+    with torch.cuda.amp.autocast(enabled=False):
+        tgt2 = self.linear2(self.dropout3(self.activation(self.linear1(tgt))))
     tgt = tgt + self.dropout4(tgt2)
     tgt = self.norm3(tgt)
     return tgt
@@ -80,8 +97,214 @@ def forward_ffn(self, tgt):
 
 **关键参数**:
 - `d_model`: 256 (隐藏维度)
-- `d_ffn`: 2048 (FFN 内部维度)
+- `d_ffn`: 2048 (FFN 内部维度，transformer.py:49 中 `dim_feedforward=2048`)
 - 输入形状: `[num_queries, batch_size, d_model]` = `[900, bs, 256]`
+- 调用位置: `transformer.py:925` → `tgt = self.forward_ffn(tgt)`
+- **改造影响**: 每个 decoder layer 都会调用此 FFN，总共有 6 层 decoder (transformer.py:48)
+
+### 2.3 详细数据流分析
+
+#### **Backbone 调用链和数据流**
+
+```mermaid
+graph TD
+    A[输入图像: samples] --> B[GroundingDINO.forward]
+    B --> C[self.backbone - Joiner]
+    C --> D[Joiner[0] - SwinTransformer]
+    C --> E[Joiner[1] - PositionEmbedding]
+    D --> F[多尺度特征图]
+    E --> G[位置编码]
+    F --> H[Input Projection]
+    G --> I[位置嵌入]
+    H --> J[Encoder输入]
+    I --> J
+```
+
+**详细调用关系**:
+
+1. **Backbone 构建层次** (`backbone.py:162-219`):
+   ```python
+   # build_backbone() 函数 - 入口
+   ├── build_swin_transformer(...)          # 创建实际的 SwinTransformer
+   │   └── SwinTransformer(...)             # swin_transformer.py:501
+   ├── build_position_encoding(...)         # 创建位置编码器  
+   └── Joiner(backbone, position_embedding) # 包装器，组合特征提取+位置编码
+   
+   # 最终返回的 model 是 Joiner 实例
+   # Joiner 继承自 nn.Sequential，包含两个组件:
+   # - self[0]: SwinTransformer (特征提取)
+   # - self[1]: PositionEmbedding (位置编码)
+   ```
+
+2. **SwinTransformer vs BackboneBase 关系**:
+   ```python
+   # 重要理解: SwinTransformer 直接作为 backbone 使用，
+   # 不需要 BackboneBase 包装 (ResNet才需要)
+   
+   if args.backbone in ["swin_T_224_1k", "swin_B_224_22k", ...]:
+       # 直接创建 SwinTransformer，不用 BackboneBase
+       backbone = build_swin_transformer(...)     # 返回 SwinTransformer 实例
+   elif args.backbone in ["resnet50", "resnet101"]:
+       # ResNet 需要 BackboneBase 包装
+       backbone = Backbone(...)                   # Backbone 继承自 BackboneBase
+   ```
+
+3. **Joiner 数据流** (`backbone.py:146-159`):
+   ```python
+   # 输入: NestedTensor(tensors=[bs,3,H,W], mask=[bs,H,W])
+   def forward(self, tensor_list: NestedTensor):
+       xs = self[0](tensor_list)           # 调用 SwinTransformer.forward()
+       # xs: Dict[str, NestedTensor] = {"0": feat1, "1": feat2, ...}
+       
+       out: List[NestedTensor] = []        # 特征图列表
+       pos = []                            # 位置编码列表
+       for name, x in xs.items():
+           out.append(x)                   # 添加特征图
+           pos.append(self[1](x))          # 添加对应位置编码
+       return out, pos
+   ```
+
+4. **SwinTransformer 数据流** (`swin_transformer.py:712-754`):
+   ```python
+   # 输入: NestedTensor
+   def forward(self, tensor_list: NestedTensor):
+       x = tensor_list.tensors             # [bs, 3, H, W]
+       
+       # Patch Embedding
+       x = self.patch_embed(x)             # [bs, embed_dim, H/4, W/4]
+       
+       # 4个 Swin Block 阶段
+       outs_dict = {}
+       for i in range(self.num_layers):    # 4层
+           layer = self.layers[i]
+           x_out, H, W, x, Wh, Ww = layer(x, Wh, Ww)
+           
+           if i in self.out_indices:       # 通常 [1,2,3] 或 [0,1,2,3]
+               # 输出多尺度特征
+               out = x_out.view(-1, H, W, self.num_features[i]).permute(0, 3, 1, 2)
+               # 生成对应的mask
+               mask = F.interpolate(tensor_list.mask[None].float(), size=out.shape[-2:])
+               outs_dict[i] = NestedTensor(out, mask.to(torch.bool)[0])
+       
+       return outs_dict
+   ```
+
+#### **关键调用关系总结**
+
+**问题澄清**: `BackboneBase.forward()` 与 `SwinTransformer.forward()` 的关系
+
+```python
+# 调用层次关系:
+GroundingDINO.forward()
+├── self.backbone(samples)                    # self.backbone 是 Joiner 实例
+    ├── Joiner[0](tensor_list)                # Joiner 的第一个组件
+    │   └── SwinTransformer.forward()         # 实际的特征提取
+    └── Joiner[1](x)                          # Joiner 的第二个组件 (位置编码)
+
+# 重要: BackboneBase 只用于 ResNet！
+# 对于 Swin Transformer，调用链是:
+# Joiner → SwinTransformer (直接调用，无中间层)
+# 对于 ResNet，调用链是:
+# Joiner → Backbone(BackboneBase) → IntermediateLayerGetter → ResNet
+```
+
+**数据流核心路径**:
+1. `samples` → `Joiner` → `SwinTransformer` → 多尺度特征图
+2. 特征图 → `Input Projection` → 统一256维
+3. 图像特征 + 文本特征 → `Encoder` → 融合特征  
+4. 融合特征 + Query → `Decoder` → 检测结果
+5. **每个 Decoder 层都调用 FFN** ← **MoE 改造点**
+
+#### **完整数据流 (带尺寸信息)**
+
+```python
+# 1. 输入图像
+samples: NestedTensor
+├── tensors: [bs, 3, 1024, 1024]    # 原始图像
+└── mask: [bs, 1024, 1024]          # padding mask
+
+# 2. Backbone 输出 (self.backbone(samples))
+features: List[NestedTensor] = [
+    NestedTensor([bs, 192, 256, 256], mask),   # 层级1: 4x下采样
+    NestedTensor([bs, 384, 128, 128], mask),   # 层级2: 8x下采样  
+    NestedTensor([bs, 768, 64, 64], mask),     # 层级3: 16x下采样
+    NestedTensor([bs, 1536, 32, 32], mask)     # 层级4: 32x下采样
+]
+poss: List[Tensor] = [
+    [bs, 256, 256, 256],    # 对应的位置编码
+    [bs, 256, 128, 128],
+    [bs, 256, 64, 64],
+    [bs, 256, 32, 32]
+]
+
+# 3. Input Projection (groundingdino.py:309)
+srcs: List[Tensor] = []
+for l, feat in enumerate(features):
+    src = self.input_proj[l](feat.tensors)  # 投影到 hidden_dim=256
+    srcs.append(src)
+    # 结果: [bs, 256, H_l, W_l] 统一通道数
+
+# 4. Flatten for Transformer (transformer.py:232-240)
+src_flatten = []
+for lvl, src in enumerate(srcs):
+    src = src.flatten(2).transpose(1, 2)    # [bs, H*W, 256]
+    src_flatten.append(src)
+memory = torch.cat(src_flatten, 1)          # [bs, sum(H*W), 256]
+
+# 5. Text Encoding
+tokenized = self.tokenizer(captions)        # 分词
+bert_output = self.bert(**tokenized)        # BERT编码
+encoded_text = self.feat_map(bert_output)   # [bs, seq_len, 256]
+
+# 6. Encoder (transformer.py:211-351)
+memory, memory_text = self.encoder(
+    src=memory,                             # [bs, sum(H*W), 256]
+    memory_text=encoded_text,               # [bs, text_len, 256]
+    ...
+)
+# 输出融合后的图像特征: [bs, sum(H*W), 256]
+
+# 7. Query Initialization (transformer.py:330-342)
+tgt = self.tgt_embed.weight.repeat(1, bs, 1).transpose(0, 1)        # [bs, 900, 256]
+refpoint_embed = self.refpoint_embed.weight.repeat(1, bs, 1).transpose(0, 1)  # [bs, 900, 4]
+
+# 8. Decoder (transformer.py:364-377)
+hs, references = self.decoder(
+    tgt=tgt.transpose(0, 1),                # [900, bs, 256]
+    memory=memory.transpose(0, 1),          # [sum(H*W), bs, 256]
+    memory_text=encoded_text,               # [bs, text_len, 256]
+    ...
+)
+# 输出: hs = [6, bs, 900, 256] (6层decoder的输出)
+
+# 9. Detection Head (groundingdino.py:332-348)
+outputs_class = []
+outputs_coord = []
+for layer_id, layer_hs in enumerate(hs):
+    cls_output = self.class_embed[layer_id](layer_hs, text_dict)  # [bs, 900, num_classes]
+    box_output = self.bbox_embed[layer_id](layer_hs)             # [bs, 900, 4]
+    outputs_class.append(cls_output)
+    outputs_coord.append(box_output)
+```
+
+#### **FFN 调用的精确位置**
+
+```python
+# 在 TransformerDecoder.forward() 中 (transformer.py:665-730)
+for layer_id, layer in enumerate(self.layers):  # 6层 decoder
+    output = layer(
+        tgt=output,                          # [900, bs, 256]
+        memory=memory,                       # [sum(H*W), bs, 256]
+        memory_text=memory_text,             # [bs, text_len, 256]
+        ...
+    )
+    # layer 是 DeformableTransformerDecoderLayer
+    # 在其 forward() 中会调用 self.forward_ffn(tgt)  ⭐️ MoE改造点
+```
+
+**每次推理的 FFN 调用次数**:
+- 6个 decoder layers × 900 queries × batch_size = **5400 × batch_size** 次 FFN 调用
+- **这就是 MoE 优化的关键目标**：减少每次 FFN 调用的计算量
 
 ## 3. MoE-FFN 改造方案
 
@@ -220,32 +443,40 @@ def initialize_router(self):
 ### 4.1 替换策略
 
 **替换位置**: `groundingdino/models/GroundingDINO/transformer.py`
-- 类: `DeformableTransformerDecoderLayer`
-- 方法: `forward_ffn`
+- 类: `DeformableTransformerDecoderLayer` (行 802-927)
+- 初始化: `__init__` 方法 (行 803-850)
+- **目标方法**: `forward_ffn` (行 861-866)
 
 **替换步骤**:
 
 1. **创建 MoE 模块**: `groundingdino/models/GroundingDINO/moe_ffn.py`
 
-2. **修改 DeformableTransformerDecoderLayer**:
+2. **修改 DeformableTransformerDecoderLayer 初始化** (transformer.py:839-845):
 ```python
-# 原来
+# 原来 (transformer.py:839-845)
 self.linear1 = nn.Linear(d_model, d_ffn)
+self.activation = _get_activation_fn(activation, d_model=d_ffn, batch_dim=1)
+self.dropout3 = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 self.linear2 = nn.Linear(d_ffn, d_model)
+self.dropout4 = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
 # 替换为
 self.moe_ffn = MoEFFN(d_model=d_model, d_ffn=d_ffn, 
-                      num_experts=8, k_active=2)
+                      num_experts=8, k_active=2, dropout=dropout)
+# 保留原有的 dropout4 和 norm3
+self.dropout4 = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 ```
 
-3. **修改 forward_ffn 方法**:
+3. **修改 forward_ffn 方法** (transformer.py:861-866):
 ```python
 def forward_ffn(self, tgt):
     # 原来
-    # tgt2 = self.linear2(self.dropout3(self.activation(self.linear1(tgt))))
+    # with torch.cuda.amp.autocast(enabled=False):
+    #     tgt2 = self.linear2(self.dropout3(self.activation(self.linear1(tgt))))
     
     # 替换为
-    tgt2 = self.moe_ffn(tgt)
+    with torch.cuda.amp.autocast(enabled=False):
+        tgt2 = self.moe_ffn(tgt)
     
     tgt = tgt + self.dropout4(tgt2)
     tgt = self.norm3(tgt)
