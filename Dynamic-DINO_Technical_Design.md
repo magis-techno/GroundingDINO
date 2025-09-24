@@ -251,10 +251,23 @@ for lvl, src in enumerate(srcs):
     src_flatten.append(src)
 memory = torch.cat(src_flatten, 1)          # [bs, sum(H*W), 256]
 
-# 5. Text Encoding
-tokenized = self.tokenizer(captions)        # 分词
-bert_output = self.bert(**tokenized)        # BERT编码
-encoded_text = self.feat_map(bert_output)   # [bs, seq_len, 256]
+# 5. Text Encoding (groundingdino.py:242-279)
+# captions 来源 (用户输入的文本查询):
+if targets is None:
+    # 推理模式: 用户通过 kw["captions"] 传入查询文本
+    # 例如: model(images, captions=["a cat", "a dog running"])
+    captions = kw["captions"]               
+else:
+    # 训练模式: 从标注数据的 targets 中提取 caption
+    # targets = [{"caption": "a cat", "boxes": ...}, ...]
+    captions = [t["caption"] for t in targets]  
+
+# 文本编码流程
+tokenized = self.tokenizer(captions, padding="longest", return_tensors="pt")  # 分词
+# 应用特殊 token mask 处理
+tokenized_for_encoder = {...}  # 详见 groundingdino.py:269-275
+bert_output = self.bert(**tokenized_for_encoder)  # BERT编码: [bs, seq_len, 768]
+encoded_text = self.feat_map(bert_output["last_hidden_state"])  # 映射到 [bs, seq_len, 256]
 
 # 6. Encoder (transformer.py:211-351)
 memory, memory_text = self.encoder(
