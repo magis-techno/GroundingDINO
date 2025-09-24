@@ -50,12 +50,138 @@
      - 实现: `transformer.py:482-595` → `TransformerEncoder.forward()`
      - Encoder层: `transformer.py:738-799` → `DeformableTransformerEncoderLayer`
 
-4. **Language-guided Query Selection**
-   - 结合图像 tokens 和 text tokens
-   - 生成 900 个 query tokens (候选检测 query)
-   - 代码位置:
-     - Query初始化: `transformer.py:330-342` → `self.tgt_embed.weight` + `self.refpoint_embed.weight`
-     - 具体实现: `transformer.py:329-351` → 在 `Transformer.forward()` 中的 query 准备阶段
+4. **Language-guided Query Selection (关键误解澄清)**
+   
+   **🚨 重要澄清**: Query Selection 的 "Language-guided" 不在初始化阶段，而在 Decoder 的处理过程中！
+   
+   **Query 初始化** (并非 language-guided):
+   
+   **900 数量来源**:
+   - 配置文件: `GroundingDINO_SwinB_cfg.py:16` → `num_queries = 900`
+   - 构建传入: `build_transformer(args)` → `transformer.py:935`
+   
+   **Embedding 创建** (`transformer.py:164-182`):
+   ```python
+   # 在 Transformer.__init__ 中创建可学习的 embedding 表
+   self.tgt_embed = nn.Embedding(900, 256)           # Query content embeddings
+   self.refpoint_embed = nn.Embedding(900, 4)        # Query position embeddings
+   nn.init.normal_(self.tgt_embed.weight.data)       # 随机初始化
+   ```
+   
+   **运行时生成** (`transformer.py:330-342`):
+   ```python
+   # 每次前向传播时，从预定义的 embedding 权重生成 query tokens
+   tgt = self.tgt_embed.weight[:, None, :].repeat(1, bs, 1).transpose(0, 1)
+   # 结果: [bs, 900, 256] - 900个内容 query embeddings
+   
+   refpoint_embed = self.refpoint_embed.weight[:, None, :].repeat(1, bs, 1).transpose(0, 1)  
+   # 结果: [bs, 900, 4] - 900个位置 query embeddings
+   ```
+   
+   **真正的 Language-guided 机制** (在 Decoder Layer 中):
+   ```python
+   # transformer.py:903-911 - 文本交叉注意力
+   if self.use_text_cross_attention:
+       tgt2 = self.ca_text(
+           self.with_pos_embed(tgt, tgt_query_pos),  # Query embeddings
+           memory_text.transpose(0, 1),              # Text features as K,V
+           memory_text.transpose(0, 1),
+           key_padding_mask=text_attention_mask,
+       )[0]
+       tgt = tgt + self.catext_dropout(tgt2)         # 融合文本信息到 query
+       tgt = self.catext_norm(tgt)
+   ```
+
+   **`refpoint_embed` 的作用** (参考点坐标):
+   ```python
+   # refpoint_embed: [bs, 900, 4] - 初始参考点坐标 (x, y, w, h)
+   # 在每个 decoder layer 中的使用 (transformer.py:667-683):
+   
+   # 1. 转换为输入坐标
+   reference_points_input = reference_points[:, :, None] * valid_ratios[None, :]
+   
+   # 2. 生成位置编码
+   query_sine_embed = gen_sineembed_for_position(reference_points_input)  # [900, bs, 512]
+   
+   # 3. 生成条件查询位置
+   raw_query_pos = self.ref_point_head(query_sine_embed)  # [900, bs, 256]
+   query_pos = pos_scale * raw_query_pos
+   
+   # 4. 传递给 decoder layer
+   output = layer(
+       tgt=output,
+       tgt_query_pos=query_pos,           # ← 来源于 refpoint_embed
+       tgt_reference_points=reference_points_input,  # ← 直接使用 refpoint_embed
+       ...
+   )
+   
+   # 5. 迭代更新参考点 (transformer.py:716-728)
+   if self.bbox_embed is not None:
+       delta_unsig = self.bbox_embed[layer_id](output)  # 预测坐标偏移
+       outputs_unsig = delta_unsig + inverse_sigmoid(reference_points)
+       new_reference_points = outputs_unsig.sigmoid()  # 更新后的参考点
+       reference_points = new_reference_points.detach()  # 下一层使用
+   ```
+
+#### **🎯 关键概念总结**
+
+**您问题的解答**:
+
+1. **Language-guided 不是两行代码**：
+   - ❌ **错误理解**: `tgt_embed.weight` + `refpoint_embed.weight` 是 language-guided
+   - ✅ **正确理解**: Language-guided 在 **每个 decoder layer 的文本交叉注意力** 中实现
+   - 📍 **核心代码**: `transformer.py:903-911` 的 `self.ca_text()` 调用
+
+2. **如何体现 Language-guided**：
+   - **Query** 通过 **文本交叉注意力** 与文本特征交互
+   - 每个 query 根据文本语义动态调整其表示
+   - 这使得 query 能够 "理解" 要检测什么物体
+
+3. **`refpoint_embed` 的用途**：
+   - **初始作用**: 提供 900 个可学习的参考点坐标 `[bs, 900, 4]`
+   - **核心功能**: 
+     - 生成 **条件位置编码** (`query_pos`)
+     - 提供 **deformable attention 的参考点**
+     - **逐层迭代更新** 坐标 (类似 iterative refinement)
+   - **最终目标**: 每个 query 对应一个检测框的预测
+
+**Language-guided 的完整流程**:
+```
+Query 初始化 → 文本交叉注意力 → 图像交叉注意力 → FFN → 坐标更新 → 下一层
+     ↑              ↑                    ↑           ↑       ↑
+   静态embedding   动态语义融合      视觉特征提取   特征变换  位置细化
+```
+
+#### **🎯 您问题的完整解答**
+
+**Q1: 900 queries 在哪里生成的？**
+- **配置设置**: `groundingdino/config/GroundingDINO_SwinB_cfg.py:16` → `num_queries = 900`
+- **传递路径**: 配置文件 → `build_transformer(args)` → `Transformer.__init__(num_queries=900)`
+- **实际数量**: 900 是一个超参数，表示模型最多可以检测 900 个物体
+
+**Q2: 900 query embeddings 是哪里生成的？**
+
+**初始化阶段** (`transformer.py:164-182`):
+```python
+# 创建两个可学习的 embedding 表
+self.tgt_embed = nn.Embedding(900, 256)      # 内容 embeddings
+self.refpoint_embed = nn.Embedding(900, 4)   # 位置 embeddings
+```
+
+**运行时生成** (`transformer.py:330-342`):
+```python
+# 从 embedding 权重生成实际的 query tokens
+tgt = self.tgt_embed.weight[:, None, :].repeat(1, bs, 1).transpose(0, 1)
+# 输出: [bs, 900, 256] - 900个查询向量，每个256维
+
+refpoint_embed = self.refpoint_embed.weight[:, None, :].repeat(1, bs, 1).transpose(0, 1)
+# 输出: [bs, 900, 4] - 900个参考点，每个4维 (x,y,w,h)
+```
+
+**关键理解**: 
+- 900 个 queries 是 **预定义的可学习参数**，不是动态生成的
+- 它们在训练过程中学习如何表示不同类型的检测目标
+- 通过文本交叉注意力，这些通用 queries 被动态调整为特定的检测查询
 
 5. **Decoder (TransformerDecoder)** ⭐️ **MoE改造目标**
    - 多个 transformer block，每层包含：
@@ -277,9 +403,31 @@ memory, memory_text = self.encoder(
 )
 # 输出融合后的图像特征: [bs, sum(H*W), 256]
 
-# 7. Query Initialization (transformer.py:330-342)
-tgt = self.tgt_embed.weight.repeat(1, bs, 1).transpose(0, 1)        # [bs, 900, 256]
-refpoint_embed = self.refpoint_embed.weight.repeat(1, bs, 1).transpose(0, 1)  # [bs, 900, 4]
+# 7. Query Initialization - 900 Queries 生成过程
+# 🎯 900 的来源: 配置文件设置
+# - groundingdino/config/GroundingDINO_SwinB_cfg.py:16 → num_queries = 900
+# - 通过 build_transformer(args) 传入 → transformer.py:935
+
+# 🎯 Query Embedding 初始化 (在 Transformer.__init__ 中)
+# transformer.py:164-168:
+self.tgt_embed = nn.Embedding(self.num_queries, d_model)  # [900, 256] 可学习参数
+nn.init.normal_(self.tgt_embed.weight.data)               # 正态分布初始化
+
+# transformer.py:181-182:
+self.init_ref_points(num_queries)  # 创建 refpoint_embed
+# → self.refpoint_embed = nn.Embedding(900, 4)  # [900, 4] 参考点坐标
+
+# 🎯 运行时 Query 生成 (transformer.py:330-342)
+# 每次前向传播时，从 embedding 权重生成实际的 query tokens:
+tgt_ = self.tgt_embed.weight[:, None, :].repeat(1, bs, 1).transpose(0, 1)
+# 详细展开:
+# self.tgt_embed.weight: [900, 256] - 可学习的 query embedding 矩阵
+# [:, None, :]: [900, 1, 256] - 添加 batch 维度
+# .repeat(1, bs, 1): [900, bs, 256] - 复制到每个 batch
+# .transpose(0, 1): [bs, 900, 256] - 调整维度顺序
+
+refpoint_embed_ = self.refpoint_embed.weight[:, None, :].repeat(1, bs, 1).transpose(0, 1)
+# refpoint_embed_: [bs, 900, 4] - 每个 query 的参考点坐标
 
 # 8. Decoder (transformer.py:364-377)
 hs, references = self.decoder(
